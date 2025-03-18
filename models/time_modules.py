@@ -52,6 +52,9 @@ class AttentionBlock(nn.Module):
         x = self.input_head(x) # Q, K, V projections
         # Rearrange for attention
         x = rearrange(x, '(t b) (he c) h w ->  (b h w) he t c', t=T, he=self.num_heads)
+
+        # breakpoint()
+
         q, k, v = x.tensor_split(3, dim=-1)
         q, k = self.qnorm(q), self.knorm(k)
         rel_pos_bias = self.rel_pos_bias(T, T)

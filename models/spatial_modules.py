@@ -17,7 +17,7 @@ except:
     
 def build_space_block(params):
     if params.space_type == 'axial_attention':
-        return partial(AxialAttentionBlock, params.embed_dim, params.num_heads, bias_type=params.bias_type)
+        return partial(AxialAttentionBlock, params.embed_dim, params.num_heads, bias_type=params.bias_type, token_mixing_struct=params.token_mixing_struct)
     else:
         raise NotImplementedError
 
@@ -120,7 +120,7 @@ class hMLP_output(nn.Module):
         return x
     
 class AxialAttentionBlock(nn.Module):
-    def __init__(self, hidden_dim=768, num_heads=12,  drop_path=0, layer_scale_init_value=1e-6, bias_type='rel'):
+    def __init__(self, hidden_dim=768, num_heads=12,  drop_path=0, layer_scale_init_value=1e-6, bias_type='rel', token_mixing_struct='low_rank'):
         super().__init__()
         self.num_heads = num_heads
         self.norm1 = RMSInstanceNorm2d(hidden_dim, affine=True)
@@ -130,6 +130,15 @@ class AxialAttentionBlock(nn.Module):
         self.gamma_mlp = nn.Parameter(layer_scale_init_value * torch.ones((hidden_dim)), 
                             requires_grad=True) if layer_scale_init_value > 0 else None
         
+        self.token_mixing_struct = token_mixing_struct
+
+        if self.token_mixing_struct == "bilinearbtt":
+            # breakpoint()
+            pass
+        else:
+            pass
+            # breakpoint()
+
         self.input_head = nn.Conv2d(hidden_dim, 3*hidden_dim, 1)
         self.output_head = nn.Conv2d(hidden_dim, hidden_dim, 1)
         self.qnorm = nn.LayerNorm(hidden_dim//num_heads)

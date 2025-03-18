@@ -10,13 +10,13 @@ basic_config: &basic_config
   enable_amp: !!bool False # Use automatic mixed precision - blows up with low variance fields right now
   compile: !!bool False # Compile model - Does not currently work
   gradient_checkpointing: !!bool False # Whether to use gradient checkpointing - Slow, but lower memory
-  exp_dir: '/scratch/nia4240/mpp-scratch/' # Output path
+  exp_dir: '/scratch/yk2516/repos/structure/multiple_physics_pretraining/mpp-scratch' # Output path
   log_interval: 1 # How often to log - Don't think this is actually implemented
   pretrained: !!bool False # Whether to load a pretrained model
   # wandb settings
   project: 'PDE_rank_bottleneck'
-  group: 'hulloo'
-  entity: 'noahamsel'
+  group: 'yilunkuang'
+  entity: 'yilunkuang'
   # Training settings
   drop_path: 0.1
   batch_size: 64
@@ -70,7 +70,8 @@ basic_config: &basic_config
               # ['~/PDEBench/2D/CFD/2D_Train_Turb', compNS, ''],
               ]
   append_datasets: [] # List of datasets to append to the input/output projections for finetuning
-
+  # token mixing structure
+  token_mixing_struct: 'low_rank'
 
 finetune: &finetune
   <<: *basic_config
