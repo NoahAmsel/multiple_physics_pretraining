@@ -484,6 +484,8 @@ if __name__ == '__main__':
     parser.add_argument("--yaml_config", default='./config/multi_ds.yaml', type=str)
     parser.add_argument("--config", default='basic_config', type=str)
     parser.add_argument("--sweep_id", default=None, type=str, help='sweep config from ./configs/sweeps.yaml')
+    parser.add_argument("--token_mixing_struct", default="low_rank", type=str)
+
     args = parser.parse_args()
     params = YParams(os.path.abspath(args.yaml_config), args.config)
     params.use_ddp = args.use_ddp
