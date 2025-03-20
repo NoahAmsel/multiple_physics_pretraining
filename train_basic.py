@@ -489,6 +489,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     params = YParams(os.path.abspath(args.yaml_config), args.config)
     params.use_ddp = args.use_ddp
+    params.token_mixing_struct = args.token_mixing_struct
+
     # Set up distributed training
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     global_rank = int(os.environ.get("RANK", 0))
