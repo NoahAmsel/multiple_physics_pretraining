@@ -106,6 +106,7 @@ class Trainer:
     def initialize_model(self, params):
         if self.params.model_type == 'avit':
             self.model = build_avit(params).to(device)
+            print(self.model)
         
         if self.params.compile:
             print('WARNING: BFLOAT NOT SUPPORTED IN SOME COMPILE OPS SO SWITCHING TO FLOAT16')
