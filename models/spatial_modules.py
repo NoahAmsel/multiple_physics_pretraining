@@ -11,6 +11,7 @@ try:
 except:
     from shared_modules import RelativePositionBias, ContinuousPositionBias1D, MLP
     
+from sympy import factorint, divisors
 
 # Param builder func
 
@@ -118,7 +119,57 @@ class hMLP_output(nn.Module):
         x = self.out_proj(x)#.flatten(2).transpose(1, 2)
         x = F.conv_transpose2d(x, self.out_kernel[:, state_labels], self.out_bias[state_labels], stride=4)
         return x
-    
+
+class LayerNorm(nn.Module):
+    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+class BilinearBTT_W_K_Projection(nn.Module):
+    def __init__(self, shape):
+        super().__init__()
+        # self.weight.shape = (c, d, Hbs)
+        self.weight = nn.Parameter(torch.randn(shape))
+
+    def forward(self, x):
+        '''x.shape = (c, BT, d)'''
+
+        if True:
+            RMS_W_K = torch.sqrt(torch.mean(self.weight**2.) + 1e-8)
+            d_in = self.weight.size(-2)
+            d_out = self.weight.size(-1)
+            init_scale_W_K = (min(d_in, d_out) / (d_in * d_in))**0.5
+            W_K_normed = self.weight / max(1, RMS_W_K / init_scale_W_K)
+
+        # output.shape = (c, BT, Hbs) = (c, BT, d) * (c, d, Hbs)
+        return torch.bmm(x, W_K_normed)
+
+class BilinearBTT_W_Q_Projection(nn.Module):
+    def __init__(self, shape):
+        super().__init__()
+        # self.weight.shape = (Hb, a, cs)
+        self.weight = nn.Parameter(torch.randn(shape))
+
+    def forward(self, x):
+        '''x.shape = (Hb, cs, BT)'''
+
+        if True:
+            RMS_W_Q = torch.sqrt(torch.mean(self.weight**2.) + 1e-8)
+            d_in = self.weight.size(-1)
+            d_out = self.weight.size(-2)
+            init_scale_W_Q = (min(d_in, d_out) / (d_in * d_in))**0.5
+            W_Q_normed = self.weight / max(1, RMS_W_Q / init_scale_W_Q)
+
+        # output.shape = (Hb, a, BT) = (Hb, a, cs) * (Hb, cs, BT)
+        return torch.bmm(W_Q_normed, x)
+
 class AxialAttentionBlock(nn.Module):
     def __init__(self, hidden_dim=768, num_heads=12,  drop_path=0, layer_scale_init_value=1e-6, bias_type='rel', token_mixing_struct='low_rank'):
         super().__init__()
@@ -133,11 +184,27 @@ class AxialAttentionBlock(nn.Module):
         self.token_mixing_struct = token_mixing_struct
 
         if self.token_mixing_struct == "bilinearbtt":
+            self.a, self.b = self.c, self.d = self.factorize(hidden_dim) # -> not true anymore...???
+
+            # TODO: assume s=1 for now!!!
+            self.s = 1
+            
             # breakpoint()
+
+            # # define BTT projection matrices
+            # self.bilinear_btt_wk = BilinearBTT_W_K_Projection((self.c, self.d, self.num_heads*self.b*self.s))
+            # self.bilinear_btt_wq = BilinearBTT_W_Q_Projection((self.num_heads*self.b, self.a, self.c*self.s))
+
+            # self.bilinear_btt_ln_PLPRXT = LayerNorm(hidden_dim, bias=False)
+            # self.bilinear_btt_ln_X = LayerNorm(hidden_dim, bias=False)
+
+            # self.c_attn_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        elif self.token_mixing_struct == "low_rank":
             pass
         else:
-            pass
-            # breakpoint()
+            raise NotImplementedError
+        
+        # breakpoint()
 
         self.input_head = nn.Conv2d(hidden_dim, 3*hidden_dim, 1)
         self.output_head = nn.Conv2d(hidden_dim, hidden_dim, 1)
@@ -155,6 +222,27 @@ class AxialAttentionBlock(nn.Module):
         self.mlp = MLP(hidden_dim)
         self.mlp_norm = RMSInstanceNorm2d(hidden_dim, affine=True)
 
+    def factorize(self, x, n=2):
+        if n == 2:
+            bigger = next(factor for factor in divisors(x) if factor > math.sqrt(x))
+            return [x//bigger, bigger]
+
+        # Get prime factors and their counts
+        prime_factors = factorint(x)
+
+        # Initialize the n integers
+        numbers = [1] * n
+
+        # Distribute the prime factors
+        for prime, count in reversed(list(prime_factors.items())):
+            for _ in range(count):
+                # Find the number with the smallest product to assign the prime factor
+                min_index = min(range(n), key=lambda i: numbers[i])
+                numbers[min_index] *= prime
+
+        # return in ascending order
+        return sorted(numbers)
+
     def forward(self, x, bcs):
         # input is t x b x c x h x w 
         B, C, H, W = x.shape
@@ -162,9 +250,13 @@ class AxialAttentionBlock(nn.Module):
         x = self.norm1(x)
         x = self.input_head(x)
 
+        # breakpoint()
+
         x = rearrange(x, 'b (he c) h w ->  b he h w c', he=self.num_heads)
         q, k, v = x.tensor_split(3, dim=-1)
         q, k = self.qnorm(q), self.knorm(k)
+
+        # breakpoint()
 
         # Do attention with current q, k, v matrices along each spatial axis then average results
         # X direction attention
