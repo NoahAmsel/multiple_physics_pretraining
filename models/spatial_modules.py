@@ -173,6 +173,7 @@ class BilinearBTT_W_Q_Projection(nn.Module):
 class AxialAttentionBlock(nn.Module):
     def __init__(self, hidden_dim=768, num_heads=12,  drop_path=0, layer_scale_init_value=1e-6, bias_type='rel', token_mixing_struct='low_rank'):
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.norm1 = RMSInstanceNorm2d(hidden_dim, affine=True)
         self.norm2 = RMSInstanceNorm2d(hidden_dim, affine=True)
@@ -189,27 +190,22 @@ class AxialAttentionBlock(nn.Module):
             # TODO: assume s=1 for now!!!
             self.s = 1
             
-            # breakpoint()
+            # define BTT projection matrices
+            self.bilinear_btt_wk = BilinearBTT_W_K_Projection((self.c, self.d, self.num_heads*self.b*self.s))
+            self.bilinear_btt_wq = BilinearBTT_W_Q_Projection((self.num_heads*self.b, self.a, self.c*self.s))
 
-            # # define BTT projection matrices
-            # self.bilinear_btt_wk = BilinearBTT_W_K_Projection((self.c, self.d, self.num_heads*self.b*self.s))
-            # self.bilinear_btt_wq = BilinearBTT_W_Q_Projection((self.num_heads*self.b, self.a, self.c*self.s))
+            self.bilinear_btt_ln_PLPRXT = LayerNorm(hidden_dim, bias=False)
+            self.bilinear_btt_ln_X = LayerNorm(hidden_dim, bias=False)
 
-            # self.bilinear_btt_ln_PLPRXT = LayerNorm(hidden_dim, bias=False)
-            # self.bilinear_btt_ln_X = LayerNorm(hidden_dim, bias=False)
-
-            # self.c_attn_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.c_attn_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
         elif self.token_mixing_struct == "low_rank":
-            pass
+            self.input_head = nn.Conv2d(hidden_dim, 3*hidden_dim, 1)
+            self.qnorm = nn.LayerNorm(hidden_dim//num_heads)
+            self.knorm = nn.LayerNorm(hidden_dim//num_heads)
         else:
             raise NotImplementedError
         
-        # breakpoint()
-
-        self.input_head = nn.Conv2d(hidden_dim, 3*hidden_dim, 1)
         self.output_head = nn.Conv2d(hidden_dim, hidden_dim, 1)
-        self.qnorm = nn.LayerNorm(hidden_dim//num_heads)
-        self.knorm = nn.LayerNorm(hidden_dim//num_heads)
         if bias_type == 'none':
             self.rel_pos_bias = lambda x, y: None
         elif bias_type == 'continuous':
@@ -248,35 +244,115 @@ class AxialAttentionBlock(nn.Module):
         B, C, H, W = x.shape
         input = x.clone()
         x = self.norm1(x)
-        x = self.input_head(x)
-
-        # breakpoint()
-
-        x = rearrange(x, 'b (he c) h w ->  b he h w c', he=self.num_heads)
-        q, k, v = x.tensor_split(3, dim=-1)
-        q, k = self.qnorm(q), self.knorm(k)
-
-        # breakpoint()
-
-        # Do attention with current q, k, v matrices along each spatial axis then average results
-        # X direction attention
-        qx, kx, vx = map(lambda x: rearrange(x, 'b he h w c ->  (b h) he w c'), [q,k,v])
+        
+        # positional embedding
         rel_pos_bias_x = self.rel_pos_bias(W, W, bcs[0, 0])
-        # Functional doesn't return attention mask :(
-        if rel_pos_bias_x is not None:
-            xx = F.scaled_dot_product_attention(qx, kx, vx, attn_mask=rel_pos_bias_x)
-        else:
-            xx = F.scaled_dot_product_attention(qx.contiguous(), kx.contiguous(), vx.contiguous())
-        xx = rearrange(xx, '(b h) he w c -> b (he c) h w', h=H)
-        # Y direction attention 
-        qy, ky, vy = map(lambda x: rearrange(x, 'b he h w c ->  (b w) he h c'), [q,k,v])
         rel_pos_bias_y = self.rel_pos_bias(H, H, bcs[0, 1])
 
-        if rel_pos_bias_y is not None:
-            xy = F.scaled_dot_product_attention(qy, ky, vy, attn_mask=rel_pos_bias_y)
-        else: # I don't understand why this was necessary but it was
-            xy = F.scaled_dot_product_attention(qy.contiguous(), ky.contiguous(), vy.contiguous())
-        xy = rearrange(xy, '(b w) he h c -> b (he c) h w', w=W)
+        if self.token_mixing_struct == "bilinearbtt":
+            v = self.c_attn_v(rearrange(x, 'b c h w -> b h w c'))
+            v = rearrange(v, 'b h w (he d) -> b he h w d', b=B, h=H, w=W, he=self.num_heads)
+            
+            #################################
+            ##### X direction attention #####
+            #################################
+            vx = rearrange(v, 'b he h w d ->  (b h) he w d')
+
+            # att_x.shape = (c, BT, d)
+            att_x = rearrange(x, 'B (c d) h w -> c (B h w) d', c=self.c, d=self.d)
+
+            # (c, BT, Hbs) = (c, BT, d) * (c, d, Hbs)
+            att_x = self.bilinear_btt_wk(att_x)
+
+            # att_x.shape = (Hb, cs, BT)
+            att_x = rearrange(att_x, "c (B h w) (he b s) -> (he b) (c s) (B h w)", B=B, h=H, w=W, he=self.num_heads, s=self.s, b=self.b, c=self.c)
+
+            # (Hb, a, BT) = (Hb, a, cs) * (Hb, cs, BT)
+            att_x = self.bilinear_btt_wq(att_x)
+
+            # att_x.shape (B, HT, ab)
+            att_x = rearrange(att_x, "(he b) a (B h w) -> (B h) (he w) (a b)", B=B, h=H, w=W, he=self.num_heads, a=self.a, b=self.b)
+
+            # att_x.shape = (B, T, HT) | Final Contraction
+            att_x = torch.bmm(self.bilinear_btt_ln_X(rearrange(x, 'B D h w -> (B h) w D')), self.bilinear_btt_ln_PLPRXT(att_x).transpose(-2, -1))
+            
+            att_x = att_x * (1.0 / math.sqrt(self.hidden_dim)) # SP att_xn logits scaling
+
+            # att_x.shape = (B, H, T, T)
+            att_x = rearrange(att_x, "(B h) w (he n) -> (B h) he w n", B=B, h=H, w=W, he=self.num_heads, n=W)
+
+            att_x = att_x + rel_pos_bias_x
+
+            att_x = torch.softmax(att_x, dim=-1)
+            xx = att_x @ vx
+
+            xx = rearrange(xx, '(b h) he w c -> b (he c) h w', h=H)
+
+            #################################
+            ##### Y direction attention #####
+            #################################
+            vy = rearrange(v, 'b he h w c ->  (b w) he h c')
+
+            # att_y.shape = (c, BT, d)
+            att_y = rearrange(x, 'B (c d) h w -> c (B w h) d', c=self.c, d=self.d)
+
+            # (c, BT, Hbs) = (c, BT, d) * (c, d, Hbs)
+            att_y = self.bilinear_btt_wk(att_y)
+
+            # att_y.shape = (Hb, cs, BT)
+            att_y = rearrange(att_y, "c (B w h) (he b s) -> (he b) (c s) (B w h)", B=B, h=H, w=W, he=self.num_heads, s=self.s, b=self.b, c=self.c)
+
+            # (Hb, a, BT) = (Hb, a, cs) * (Hb, cs, BT)
+            att_y = self.bilinear_btt_wq(att_y)
+
+            # att_y.shape (B, HT, ab)
+            att_y = rearrange(att_y, "(he b) a (B w h) -> (B w) (he h) (a b)", B=B, h=H, w=W, he=self.num_heads, a=self.a, b=self.b)
+
+            # att_y.shape = (B, T, HT) | Final Contraction
+            att_y = torch.bmm(self.bilinear_btt_ln_X(rearrange(x, 'B D h w -> (B w) h D')), self.bilinear_btt_ln_PLPRXT(att_y).transpose(-2, -1))
+
+            att_y = att_y * (1.0 / math.sqrt(self.hidden_dim)) # SP att_yn logits scaling
+
+            # att_y.shape = (B, H, T, T)
+            att_y = rearrange(att_y, "(B w) h (he n) -> (B w) he h n", B=B, h=H, w=W, he=self.num_heads, n=W)
+
+            att_y = att_y + rel_pos_bias_y
+
+            att_y = torch.softmax(att_y, dim=-1)
+            xy = att_y @ vy
+
+            xy = rearrange(xy, '(b w) he h c -> b (he c) h w', w=W)
+
+        elif self.token_mixing_struct == "low_rank":
+            x = self.input_head(x)
+
+            x = rearrange(x, 'b (he c) h w ->  b he h w c', he=self.num_heads)
+            q, k, v = x.tensor_split(3, dim=-1)
+            q, k = self.qnorm(q), self.knorm(k)
+
+            # Do attention with current q, k, v matrices along each spatial axis then average results
+            # X direction attention
+            qx, kx, vx = map(lambda x: rearrange(x, 'b he h w c ->  (b h) he w c'), [q,k,v])
+            
+            # Functional doesn't return attention mask :(
+            if rel_pos_bias_x is not None:
+                xx = F.scaled_dot_product_attention(qx, kx, vx, attn_mask=rel_pos_bias_x)
+            else:
+                xx = F.scaled_dot_product_attention(qx.contiguous(), kx.contiguous(), vx.contiguous())
+            xx = rearrange(xx, '(b h) he w c -> b (he c) h w', h=H)
+            # Y direction attention 
+            qy, ky, vy = map(lambda x: rearrange(x, 'b he h w c ->  (b w) he h c'), [q,k,v])
+            
+
+            if rel_pos_bias_y is not None:
+                xy = F.scaled_dot_product_attention(qy, ky, vy, attn_mask=rel_pos_bias_y)
+            else: # I don't understand why this was necessary but it was
+                xy = F.scaled_dot_product_attention(qy.contiguous(), ky.contiguous(), vy.contiguous())
+            xy = rearrange(xy, '(b w) he h c -> b (he c) h w', w=W)
+
+        else:
+            raise NotImplementedError
+
         # Combine
         x = (xx + xy) / 2
         x = self.norm2(x)
@@ -290,5 +366,5 @@ class AxialAttentionBlock(nn.Module):
         x = rearrange(x, 'b h w c -> b c h w')
         x = self.mlp_norm(x)
         output = input + self.drop_path(self.gamma_mlp[None, :, None, None] * x)
-
+        
         return output
