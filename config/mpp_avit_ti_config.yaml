@@ -19,16 +19,16 @@ basic_config: &basic_config
   entity: 'yilunkuang'
   # Training settings
   drop_path: 0.1
-  batch_size: 64
+  batch_size: 24
   max_epochs: 30
   scheduler_epochs: -1
   epoch_size: 200 # Artificial epoch size
   rescale_gradients: !!bool False # Activate hook that scales block gradients to norm 1
-  optimizer: 'adan' # adam, adan, whatever else i end up adding - adan did better on HP sweep
+  optimizer: 'adam' # adam, adan, whatever else i end up adding - adan did better on HP sweep
   scheduler: 'cosine' # Only cosine implemented
   warmup_steps: 1000 # Warmup when not using DAdapt
   learning_rate: -1 # -1 means use DAdapt
-  weight_decay: 1e-3 
+  weight_decay: 0.0
   n_states: 12   # Number of state variables across the datasets - Can be larger than real number and things will just go unused
   state_names: ['Pressure', 'Vx', 'Vy', 'Density',  'Vx', 'Vy', 'Density', 'Pressure'] # Should be sorted
   dt: 1 # Striding of data - Not currently implemented > 1
@@ -42,8 +42,8 @@ basic_config: &basic_config
   space_type: 'axial_attention' # Conditional on block type
   tie_fields: !!bool False # Whether to use 1 embedding per field per data
   embed_dim: 192 # Dimension of internal representation - 192/384/768/1024 for Ti/S/B/L
-  num_heads: 3 # Number of heads for attention - 3/6/12/16 for Ti/S/B/L
-  processor_blocks: 12 # Number of transformer blocks in the backbone - 12/12/12/24 for Ti/S/B/L
+  num_heads: 16 # Number of heads for attention - 3/6/12/16 for Ti/S/B/L
+  processor_blocks: 6 # Number of transformer blocks in the backbone - 12/12/12/24 for Ti/S/B/L
   patch_size: [16, 16] # Actually currently hardcoded at 16
   bias_type: 'rel'  # Options rel, continuous, none
   # Data settings

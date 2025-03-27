@@ -52,6 +52,15 @@ def add_weight_decay(model, weight_decay=1e-5, inner_lr=1e-3, skip_list=()):
             {'params': no_decay, 'weight_decay': 0.,},
             {'params': decay, 'weight_decay': weight_decay}]
 
+def compute_muP_lr(name, fan_out, fan_in, base_width_factor, lr, opt_name):
+    if opt_name == "adam":
+        base_lr = lr * base_width_factor / fan_in
+        print(f"### {name} base_lr = lr / fan_in = {lr} * {base_width_factor} / {fan_in} = {base_lr} ###\n")
+    else:
+        raise ValueError
+    
+    return base_lr
+
 class Trainer:
     def __init__(self, params, global_rank, local_rank, device, sweep_id=None):
         self.device = device
@@ -119,22 +128,77 @@ class Trainer:
         
         self.single_print(f'Model parameter count: {sum([p.numel() for p in self.model.parameters()])}')
 
-    def initialize_optimizer(self, params): 
-        parameters = add_weight_decay(self.model, self.params.weight_decay) # Dont use weight decay on bias/scaling terms
-        if params.optimizer == 'adam':
-            if self.params.learning_rate < 0:
-                self.optimizer =  DAdaptAdam(parameters, lr=1., growth_rate=1.05, log_every=100, decouple=True )
+
+    def initialize_optimizer(self, params):         
+        assert self.params.weight_decay==0.0
+        assert params.optimizer == 'adam'
+        assert self.params.learning_rate > 0
+
+        ############################
+        ########## muPify ##########
+        ############################
+        param_dict = {pn: p for pn, p in self.model.named_parameters() if p.requires_grad}
+
+        param_groups = []
+        peak_lrs = {}  # store base learning rates by param name
+
+        for name, param in param_dict.items():
+            if "bilinear_btt_wk.weight" in name:
+                # (c, d, Hbs)
+                _, fan_in, fan_out = param.shape
+                base_width_factor = 192
+
+                # muP initialization
+                nn.init.normal_(param, mean=0.0, std=1.0 / (fan_in ** 0.5))
+                print(f"### {name} initialized with std = 1.0 / ({fan_in} ** 0.5)={1.0 / (fan_in ** 0.5)} ###")
+            elif "bilinear_btt_wq.weight" in name:
+                # (bH, a, cs)
+                _, fan_out, fan_in = param.shape
+                base_width_factor = 192
+
+                # muP initialization
+                nn.init.normal_(param, mean=0.0, std=1.0 / (fan_in ** 0.5))
+                print(f"### {name} initialized with std = 1.0 / ({fan_in} ** 0.5)={1.0 / (fan_in ** 0.5)} ###")
             else:
-                self.optimizer = optim.AdamW(parameters, lr=params.learning_rate)
-        elif params.optimizer == 'adan':
-            if self.params.learning_rate < 0:
-                self.optimizer =  DAdaptAdan(parameters, lr=1., growth_rate=1.05, log_every=100)
-            else:
-                self.optimizer = Adan(parameters, lr=params.learning_rate)
-        elif params.optimizer == 'sgd':
-            self.optimizer = optim.SGD(self.model.parameters(), lr=params.learning_rate, momentum=0.9)
-        else: 
-            raise ValueError(f"Optimizer {params.optimizer} not supported")
+                fan_out, fan_in = None, self.params.embed_dim
+                base_width_factor = 192
+
+                print(f"### {name} doesn't need muP for now ###")
+
+            # muP learning rate
+            base_lr = compute_muP_lr(name, fan_out, fan_in, base_width_factor, params.learning_rate, params.optimizer)
+
+            group = {
+                'params': param, 
+                'weight_decay': 0.0,
+                'lr': base_lr, 
+                'name': name}
+            peak_lrs[name] = base_lr
+            param_groups.append(group)
+
+        self.optimizer = optim.AdamW(param_groups)
+        for group in param_groups:
+            print(f"{group['name']} | lr ={group['lr']}")
+        
+
+
+        # # old
+        # parameters = add_weight_decay(self.model, self.params.weight_decay) # Dont use weight decay on bias/scaling terms
+
+        # if params.optimizer == 'adam':
+        #     if self.params.learning_rate < 0:
+        #         self.optimizer =  DAdaptAdam(parameters, lr=1., growth_rate=1.05, log_every=100, decouple=True )
+        #     else:
+        #         self.optimizer = optim.AdamW(parameters, lr=params.learning_rate)
+        # elif params.optimizer == 'adan':
+        #     if self.params.learning_rate < 0:
+        #         self.optimizer =  DAdaptAdan(parameters, lr=1., growth_rate=1.05, log_every=100)
+        #     else:
+        #         self.optimizer = Adan(parameters, lr=params.learning_rate)
+        # elif params.optimizer == 'sgd':
+        #     self.optimizer = optim.SGD(self.model.parameters(), lr=params.learning_rate, momentum=0.9)
+        # else: 
+        #     raise ValueError(f"Optimizer {params.optimizer} not supported")
         self.gscaler = amp.GradScaler(enabled= (self.mp_type == torch.half and params.enable_amp))
 
     def initialize_scheduler(self, params):
@@ -486,11 +550,13 @@ if __name__ == '__main__':
     parser.add_argument("--config", default='basic_config', type=str)
     parser.add_argument("--sweep_id", default=None, type=str, help='sweep config from ./configs/sweeps.yaml')
     parser.add_argument("--token_mixing_struct", default="low_rank", type=str)
+    parser.add_argument("--learning_rate", default=-1.0, type=float)
 
     args = parser.parse_args()
     params = YParams(os.path.abspath(args.yaml_config), args.config)
     params.use_ddp = args.use_ddp
     params.token_mixing_struct = args.token_mixing_struct
+    params.learning_rate = args.learning_rate
 
     # Set up distributed training
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
